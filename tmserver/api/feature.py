@@ -481,8 +481,6 @@ def get_metadata(experiment_id, mapobject_type_id):
             raise MalformedRequestError(
                 'Invalid query parameter "well_pos_x" for mapobjects of type '
                 '"{0}"'.format(mapobject_type_name)
-<<<<<<< HEAD
-=======
             )
 
     if mapobject_type_ref_type == 'Plate':
@@ -491,7 +489,6 @@ def get_metadata(experiment_id, mapobject_type_id):
             raise MalformedRequestError(
                 'Invalid query parameter "well_name" for mapobjects of type '
                 '"{0}"'.format(mapobject_type_name)
->>>>>>> Update package according to changes in tmlibrary
             )
 
     def generate_feature_matrix(mapobject_type_id, ref_type):
