@@ -41,151 +41,6 @@ from tmserver.error import *
 logger = logging.getLogger(__name__)
 
 
-def _get_matching_plates(session, plate_name):
-    query = session.query(
-            tm.Plate.id,
-            tm.Plate.name.label('plate_name')
-        )
-    if plate_name is not None:
-        logger.debug('filter metadata by plate "%s"', plate_name)
-        results = session.query(tm.Plate.id).\
-            filter_by(name=plate_name).\
-            count()
-        if results == 0:
-            raise ResourceNotFoundError(tm.Plate, name=plate_name)
-        query = query.filter(tm.Plate.name == plate_name)
-    return query.order_by(tm.Plate.id).all()
-
-
-def _get_matching_wells(session, plate_name, well_name):
-    query = session.query(
-            tm.Well.id,
-            tm.Well.name.label('well_name'),
-            tm.Plate.name.label('plate_name')
-        ).\
-        join(tm.Plate)
-    if plate_name is not None:
-        logger.debug('filter metadata by plate "%s"', plate_name)
-        results = session.query(tm.Plate.id).\
-            filter_by(name=plate_name).\
-            count()
-        if results == 0:
-            raise ResourceNotFoundError(tm.Plate, name=plate_name)
-        query = query.filter(tm.Plate.name == plate_name)
-    if well_name is not None:
-        logger.debug('filter metadata by well "%s"', well_name)
-        results = session.query(tm.Well.id).\
-            filter_by(name=well_name).\
-            count()
-        if results == 0:
-            raise ResourceNotFoundError(tm.Well, name=well_name)
-        query = query.filter(tm.Well.name == well_name)
-    return query.order_by(tm.Well.id).all()
-
-
-def _get_matching_sites(session, plate_name, well_name, well_pos_y, well_pos_x):
-    query = session.query(
-            tm.Site.id,
-            tm.Site.y.label('well_pos_y'),
-            tm.Site.x.label('well_pos_x'),
-            tm.Well.name.label('well_name'),
-            tm.Plate.name.label('plate_name')
-        ).\
-        join(tm.Well).\
-        join(tm.Plate)
-    if plate_name is not None:
-        logger.debug('filter metadata by plate "%s"', plate_name)
-        results = session.query(tm.Plate.id).\
-            filter_by(name=plate_name).\
-            count()
-        if results == 0:
-            raise ResourceNotFoundError(tm.Plate, name=plate_name)
-        query = query.filter(tm.Plate.name == plate_name)
-    if well_name is not None:
-        logger.debug('filter metadata by well "%s"', well_name)
-        results = session.query(tm.Well.id).\
-            filter_by(name=well_name).\
-            count()
-        if results == 0:
-            raise ResourceNotFoundError(tm.Well, name=well_name)
-        query = query.filter(tm.Well.name == well_name)
-    if well_pos_y is not None:
-        logger.debug(
-            'filter metadata by well position y %d', well_pos_y
-        )
-        results = session.query(tm.Site.id).\
-            filter_by(y=well_pos_y).\
-            count()
-        if results == 0:
-            raise ResourceNotFoundError(tm.Site, y=well_pos_y)
-        query = query.filter(tm.Site.y == well_pos_y)
-    if well_pos_x is not None:
-        logger.debug(
-            'filter metadata by well position x %d', well_pos_x
-        )
-        results = session.query(tm.Site.id).\
-            filter_by(x=well_pos_x).\
-            count()
-        if results == 0:
-            raise ResourceNotFoundError(tm.Site, x=well_pos_x)
-        query = query.filter(tm.Site.x == well_pos_x)
-    return query.order_by(tm.Site.id).all()
-
-
-def _get_matching_layers(session, tpoint):
-    query = session.query(tm.SegmentationLayer)
-    if tpoint is not None:
-        logger.debug('filter feature values by tpoint %d', tpoint)
-        results = session.query(tm.SegmentationLayer.id).\
-            filter_by(tpoint=tpoint).\
-            count()
-        if results == 0:
-            raise ResourceNotFoundError(tm.SegmentationLayer, tpoint=tpoint)
-        query = query.filter(tm.SegmentationLayer.tpoint == tpoint)
-    return query.all()
-
-
-def _get_mapobjects_at_ref_position(session, mapobject_type_id,
-        ref_id, segmentation_layer_ids):
-
-    return session.query(
-            tm.Mapobject.id, tm.MapobjectSegmentation.label,
-            tm.MapobjectSegmentation.segmentation_layer_id
-        ).\
-        join(tm.MapobjectSegmentation).\
-        filter(
-            tm.Mapobject.mapobject_type_id == mapobject_type_id,
-            tm.Mapobject.partition_key == ref_id,
-            tm.MapobjectSegmentation.segmentation_layer_id.in_(
-                segmentation_layer_ids
-            )
-        ).\
-        order_by(tm.Mapobject.id).\
-        all()
-
-
-def _get_border_mapobjects_at_ref_position(session, mapobject_ids,
-        ref_type_id, ref_id):
-    ref_segmentation = session.query(
-            tm.MapobjectSegmentation.geom_polygon
-        ).\
-        join(tm.Mapobject).\
-        filter(
-            tm.Mapobject.partition_key == ref_id,
-            tm.Mapobject.mapobject_type_id == ref_type_id
-        ).\
-        one()
-
-    return session.query(tm.MapobjectSegmentation.mapobject_id).\
-        filter(
-            tm.MapobjectSegmentation.mapobject_id.in_(mapobject_ids),
-            tm.MapobjectSegmentation.geom_polygon.ST_Intersects(
-                ref_segmentation.geom_polygon.ST_Boundary()
-            )
-        ).\
-        all()
-
-
 @api.route('/experiments/<experiment_id>/mapobject_types', methods=['GET'])
 @jwt_required()
 @decode_query_ids('read')
@@ -381,8 +236,15 @@ def delete_mapobject_type(experiment_id, mapobject_type_id):
         'delete mapobject type %d of experiment %d',
         mapobject_type_id, experiment_id
     )
-    with tm.utils.ExperimentConnection(experiment_id) as connection:
-        tm.MapobjectType.delete_cascade(connection, id=mapobject_type_id)
+    with tm.utils.ExperimentSession(experiment_id, False) as session:
+        # This may take a long time and potentially cause problems with uWSGI
+        # timeouts.
+        session.query(tm.Mapobject).\
+            filter_by(mapobject_type_id=mapobject_type_id).\
+            delete()
+        session.query(tm.MapobjectType).\
+            filter_by(id=mapobject_type_id).\
+            delete()
     return jsonify(message='ok')
 
 
@@ -447,8 +309,7 @@ def get_features(experiment_id, mapobject_type_id):
 )
 @jwt_required()
 @assert_form_params(
-    'plate_name', 'well_name', 'well_pos_x', 'well_pos_y', 'zplane', 'tpoint',
-    'image'
+    'plate_name', 'well_name', 'zplane', 'tpoint', 'image'
 )
 @decode_query_ids('write')
 def add_segmentations(experiment_id, mapobject_type_id):
@@ -468,8 +329,8 @@ def add_segmentations(experiment_id, mapobject_type_id):
         :query image: 2D pixels array (required)
         :query plate_name: name of the plate (required)
         :query well_name: name of the well (required)
-        :query well_pos_x: x-coordinate of the site within the well (required)
-        :query well_pos_y: y-coordinate of the site within the well (required)
+        :query well_pos_x: x-coordinate of the site within the well (optional)
+        :query well_pos_y: y-coordinate of the site within the well (optional)
         :query tpoint: time point (required)
         :query zplane: z-plane (required)
 
@@ -477,17 +338,22 @@ def add_segmentations(experiment_id, mapobject_type_id):
     data = request.get_json()
     plate_name = data.get('plate_name')
     well_name = data.get('well_name')
-    well_pos_x = int(data.get('well_pos_x'))
-    well_pos_y = int(data.get('well_pos_y'))
     zplane = int(data.get('zplane'))
     tpoint = int(data.get('tpoint'))
-    align = is_true(request.args.get('align')) # TODO
+    well_pos_x = data.get('well_pos_x')
+    well_pos_y = data.get('well_pos_y')
+    if well_pos_y is not None and well_pos_x is not None:
+        well_pos_y = int(well_pos_y)
+        well_pos_x = int(well_pos_x)
+    elif well_pos_y is not None or well_pos_x is None:
+        raise MissingGETParameterError('well_pos_x')
+    elif well_pos_y is None or well_pos_x is not None:
+        raise MissingGETParameterError('well_pos_y')
 
     logger.info(
         'add segmentations for mapobject type %d of experiment %d at '
-        'plate "%s", well "%s", well position %d/%d, zplane %d, time point %d',
-        mapobject_type_id, experiment_id, plate_name, well_name, well_pos_y,
-        well_pos_x, zplane, tpoint
+        'plate "%s", well "%s", zplane %d, time point %d',
+        mapobject_type_id, experiment_id, plate_name, well_name, zplane, tpoint
     )
 
     pixels = data.get('image')
@@ -502,63 +368,73 @@ def add_segmentations(experiment_id, mapobject_type_id):
         )
         segmentation_layer_id = segmentation_layer.id
 
-        site = session.query(tm.Site).\
-            join(tm.Well).\
+        well = session.query(tm.Well).\
             join(tm.Plate).\
+            filter(tm.Plate.name == plate_name, tm.Well.name == well_name).\
+            one()
+        partition_key = well.id
+        if well_pos_y is not None and well_pos_x is not None:
+            site = session.query(tm.Site).\
+                filter_by(y=well_pos_y, x=well_pos_x, well_id=well.id).\
+                one()
+            ref_instance = site
+        else:
+            ref_instance = well
+
+        ref_mapobject_type = session.query(tm.MapobjectType).\
+            filter_by(ref_type=ref_instance.__class__.__name__).\
+            one()
+        ref_segment = session.query(
+                tm.MapobjectSegmentation.mapobject_id,
+                tm.MapobjectSegmentation.geom_polygon
+            ).\
+            join(tm.Mapobject).\
             filter(
-                tm.Plate.name == plate_name, tm.Well.name == well_name,
-                tm.Site.y == well_pos_y, tm.Site.x == well_pos_x
+                tm.Mapobject.ref_id == ref_instance.id,
+                tm.Mapobject.mapobject_type_id == ref_mapobject_type.id,
+                tm.Mapobject.partition_key == partition_key
             ).\
             one()
 
-        if align:
-            y_offset, x_offset = site.aligned_offset
-            if array.shape != site.aligned_image_size:
-                raise MalformedRequestError('Image has wrong dimensions')
-        else:
-            y_offset, x_offset = site.offset
-            if array.shape != site.image_size:
-                raise MalformedRequestError('Image has wrong dimensions')
-        site_id = site.id
+        y_offset, x_offset = ref_instance.offset
+        if array.shape != ref_instance.image_size:
+            raise MalformedRequestError('Provided image has wrong dimensions.')
 
-        metadata = SegmentationImageMetadata(
-            mapobject_type_id, site_id, tpoint, zplane
-        )
-        image = SegmentationImage(array, metadata)
+        image = SegmentationImage(array)
 
         existing_segmentations_map = dict(
             session.query(
                 tm.MapobjectSegmentation.label,
                 tm.MapobjectSegmentation.mapobject_id
             ).\
-            join(tm.Mapobject).\
             filter(
+                tm.MapobjectSegmentation.partition_key == partition_key,
+                tm.MapobjectSegmentation.segmentation_layer_id == layer_id,
                 tm.MapobjectSegmentation.label.in_(labels),
-                tm.Mapobject.mapobject_type_id == mapobject_type_id,
-                tm.MapobjectSegmentation.partition_key == site_id
+                tm.MapobjectSegmentation.geom_centroid.ST_CoveredBy(
+                    ref_segment.geom_polygon
+                )
             ).\
             all()
         )
 
-    with tm.utils.ExperimentConnection(experiment_id) as connection:
+    with tm.utils.ExperimentSession(experiment_id, False) as session:
         segmentations = list()
         for label, polygon in image.extract_polygons(y_offset, x_offset):
-            mapobject = tm.Mapobject(site_id, mapobject_type_id)
             if label in existing_segmentations_map:
                 # A parent mapobject with the same label may already exist,
-                # because it got already created for another zplane/tpoint.
-                # The segmentation for the given zplane/tpoint must not yet
-                # exist, however. This will lead to an error upon insertion.
-                mapobject.id = existing_segmentations_map[label]
+                # since it may have been created for another zplane/tpoint.
+                mapobject_id = existing_segmentations_map[label]
+                mapobject = tm.Mapobject(partition_key, mapobject_type_id)
             else:
-                mapobject = tm.Mapobject.add(connection, mapobject)
-            seg = tm.MapobjectSegmentation(
-                partition_key=site_id, mapobject_id=mapobject.id,
+                session.add(mapobject)
+                session.flush()
+            segmentation = tm.MapobjectSegmentation(
+                partition_key=paritition_key, mapobject_id=mapobject.id,
                 geom_polygon=polygon, geom_centroid=polygon.centroid,
                 segmentation_layer_id=segmentation_layer_id, label=label
             )
-            segmentations.append(seg)
-        tm.MapobjectSegmentation.add_multiple(connection, segmentations)
+            session.add(segmentation)
 
     return jsonify(message='ok')
 
@@ -569,7 +445,7 @@ def add_segmentations(experiment_id, mapobject_type_id):
 )
 @jwt_required()
 @assert_query_params(
-    'plate_name', 'well_name', 'well_pos_x', 'well_pos_y', 'zplane', 'tpoint'
+    'plate_name', 'well_name', 'zplane', 'tpoint'
 )
 @decode_query_ids('read')
 def get_segmentations(experiment_id, mapobject_type_id):
@@ -609,8 +485,8 @@ def get_segmentations(experiment_id, mapobject_type_id):
 
         :query plate_name: name of the plate (required)
         :query well_name: name of the well (required)
-        :query well_pos_x: x-coordinate of the site within the well (required)
-        :query well_pos_y: y-coordinate of the site within the well (required)
+        :query well_pos_x: x-coordinate of the site within the well (optional)
+        :query well_pos_y: y-coordinate of the site within the well (optional)
         :query tpoint: time point (required)
         :query zplane: z-plane (required)
 
@@ -621,13 +497,11 @@ def get_segmentations(experiment_id, mapobject_type_id):
     well_pos_y = request.args.get('well_pos_y', type=int)
     zplane = request.args.get('zplane', type=int)
     tpoint = request.args.get('tpoint', type=int)
-    align = is_true(request.args.get('align'))
 
     logger.info(
         'get segmentations for mapobject type %d of experiment %d at '
-        'plate "%s", well "%s", well position %d/%d, zplane %d, time point %d',
-        mapobject_type_id, experiment_id, plate_name, well_name, well_pos_y,
-        well_pos_x, zplane, tpoint
+        'plate "%s", well "%s", zplane %d, time point %d',
+        mapobject_type_id, experiment_id, plate_name, well_name, zplane, tpoint
     )
 
     with tm.utils.MainSession() as session:
@@ -635,31 +509,58 @@ def get_segmentations(experiment_id, mapobject_type_id):
         experiment_name = experiment.name
 
     with tm.utils.ExperimentSession(experiment_id) as session:
-        site = session.query(tm.Site).\
-            join(tm.Well).\
+        segmentation_layer = session.get_or_create(
+            tm.SegmentationLayer,
+            mapobject_type_id=mapobject_type_id, tpoint=tpoint, zplane=zplane
+        )
+        layer_id = segmentation_layer.id
+
+        well = session.query(tm.Well).\
             join(tm.Plate).\
+            filter(tm.Plate.name == plate_name, tm.Well.name == well_name).\
+            one()
+        partition_key = well.id
+        if well_pos_y is not None and well_pos_x is not None:
+            site = session.query(tm.Site).\
+                filter_by(y=well_pos_y, x=well_pos_x, well_id=well.id).\
+                one()
+            ref_instance = site
+        else:
+            ref_instance = well
+
+        ref_mapobject_type = session.query(tm.MapobjectType).\
+            filter_by(ref_type=ref_instance.__class__.__name__).\
+            one()
+        ref_segment = session.query(
+                tm.MapobjectSegmentation.mapobject_id,
+                tm.MapobjectSegmentation.geom_polygon
+            ).\
+            join(tm.Mapobject).\
             filter(
-                tm.Plate.name == plate_name,
-                tm.Well.name == well_name,
-                tm.Site.x == well_pos_x, tm.Site.y == well_pos_y
+                tm.Mapobject.ref_id == ref_instance.id,
+                tm.Mapobject.mapobject_type_id == ref_mapobject_type.id,
+                tm.Mapobject.partition_key == partition_key
             ).\
             one()
-        mapobject_type = session.query(tm.MapobjectType).\
-            get(mapobject_type_id)
-        polygons = mapobject_type.get_segmentations_per_site(
-            site.id, tpoint=tpoint, zplane=zplane
-        )
+
+        y_offset, x_offset = ref_instance.offset
+        height, width = ref_instance.height, ref_instance.width
+
+        polygons = session.query(
+                tm.MapobjectSegmentation.label,
+                tm.MapobjectSegmentation.geom_polygon
+            ).\
+            filter(
+                tm.MapobjectSegmentation.partition_key == partition_key,
+                tm.MapobjectSegmentation.segmentation_layer_id == layer_id,
+                tm.MapobjectSegmentation.geom_polygon.ST_CoveredBy(
+                    ref_segment.geom_polygon
+                )
+            ).\
+            all()
+
         if len(polygons) == 0:
             raise ResourceNotFoundError(tm.MapobjectSegmentation, request.args)
-
-        if align:
-            y_offset, x_offset = site.aligned_offset
-            height = site.aligned_height
-            width = site.aligned_width
-        else:
-            y_offset, x_offset = site.offset
-            height = site.height
-            width = site.width
 
     img = SegmentationImage.create_from_polygons(
         polygons, y_offset, x_offset, (height, width)

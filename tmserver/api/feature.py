@@ -24,6 +24,7 @@ import pandas as pd
 from cStringIO import StringIO
 from flask_jwt import jwt_required
 from flask import jsonify, request, send_file, Response, stream_with_context
+from sqlalchemy import null
 from sqlalchemy.orm.exc import NoResultFound
 
 import tmlib.models as tm
@@ -34,11 +35,6 @@ from tmserver.util import (
     is_true, is_false
 )
 from tmserver.error import *
-from tmserver.api.mapobject import (
-    _get_matching_sites, _get_matching_plates, _get_matching_wells,
-    _get_matching_layers, _get_mapobjects_at_ref_position,
-    _get_border_mapobjects_at_ref_position
-)
 
 
 logger = logging.getLogger(__name__)
@@ -119,8 +115,11 @@ def delete_feature(experiment_id, feature_id):
 
     """
     logger.info('delete feature %d of experiment %d', feature_id, experiment_id)
-    with tm.utils.ExperimentConnection(experiment_id) as connection:
-        tm.Feature.delete_cascade(connection, id=feature_id)
+    with tm.utils.ExperimentSession(experiment_id, False) as session:
+        # This query may take long in case there are many mapobjects and may
+        # consequently cause uWSGI timeouts.
+        session.query(tm.FeatureValue.values.delete(str(feature_id)))
+        session.query(tm.Feature).filter_by(id=feature_id).delete()
     return jsonify(message='ok')
 
 
@@ -130,8 +129,7 @@ def delete_feature(experiment_id, feature_id):
 )
 @jwt_required()
 @assert_form_params(
-    'plate_name', 'well_name', 'well_pos_x', 'well_pos_y', 'tpoint',
-    'names', 'values', 'labels'
+    'plate_name', 'well_name', 'tpoint', 'names', 'values', 'labels'
 )
 @decode_query_ids('write')
 def add_feature_values(experiment_id, mapobject_type_id):
@@ -175,21 +173,38 @@ def add_feature_values(experiment_id, mapobject_type_id):
         :statuscode 401: unauthorized
         :statuscode 404: not found
 
+        :query names: names of features (required)
+        :query labels: object labels (required)
+        :query values: *m*x*n* array with *m* objects and *n* features (required)
+        :query plate_name: name of the plate (required)
+        :query well_name: name of the well (required)
+        :query well_pos_x: x-coordinate of the site within the well (optional)
+        :query well_pos_y: y-coordinate of the site within the well (optional)
+        :query tpoint: time point (required)
+        :query zplane: z-plane (required)
+
     """
     data = request.get_json()
 
     plate_name = data.get('plate_name')
     well_name = data.get('well_name')
-    well_pos_x = int(data.get('well_pos_x'))
-    well_pos_y = int(data.get('well_pos_y'))
     tpoint = int(data.get('tpoint'))
+    well_pos_x = data.get('well_pos_x')
+    well_pos_y = data.get('well_pos_y')
+    if well_pos_y is not None and well_pos_x is not None:
+        well_pos_y = int(well_pos_y)
+        well_pos_x = int(well_pos_x)
+    elif well_pos_y is not None or well_pos_x is None:
+        raise MissingGETParameterError('well_pos_x')
+    elif well_pos_y is None or well_pos_x is not None:
+        raise MissingGETParameterError('well_pos_y')
 
-    feature_names = data.get('names')
-    feature_values = data.get('values')
+    names = data.get('names')
+    values = data.get('values')
     labels = data.get('labels')
 
     try:
-        data = pd.DataFrame(feature_values, columns=feature_names, index=labels)
+        data = pd.DataFrame(values, columns=names, index=labels)
     except Exception as err:
         logger.error(
             'feature values were not provided in correct format: %s', str(err)
@@ -208,49 +223,70 @@ def add_feature_values(experiment_id, mapobject_type_id):
         data.rename(feature_lut, inplace=True)
 
     with tm.utils.ExperimentSession(experiment_id) as session:
-        site = session.query(tm.Site).\
-            join(tm.Well).\
+        segmentation_layer = session.get_or_create(
+            tm.SegmentationLayer,
+            mapobject_type_id=mapobject_type_id, tpoint=tpoint, zplane=zplane
+        )
+        segmentation_layer_id = segmentation_layer.id
+
+        well = session.query(tm.Well).\
             join(tm.Plate).\
+            filter(tm.Plate.name == plate_name, tm.Well.name == well_name).\
+            one()
+        partition_key = well.id
+        if well_pos_y is not None and well_pos_x is not None:
+            site = session.query(tm.Site).\
+                filter_by(y=well_pos_y, x=well_pos_x, well_id=well.id).\
+                one()
+            ref_instance = site
+        else:
+            ref_instance = well
+
+        ref_mapobject_type = session.query(tm.MapobjectType).\
+            filter_by(ref_type=ref_instance.__class__.__name__).\
+            one()
+        ref_segment = session.query(
+                tm.MapobjectSegmentation.mapobject_id,
+                tm.MapobjectSegmentation.geom_polygon
+            ).\
+            join(tm.Mapobject).\
             filter(
-                tm.Plate.name == plate_name, tm.Well.name == well_name,
-                tm.Site.y == well_pos_y, tm.Site.x == well_pos_x
+                tm.Mapobject.ref_id == ref_instance.id,
+                tm.Mapobject.mapobject_type_id == ref_mapobject_type.id,
+                tm.Mapobject.partition_key == partition_key
             ).\
             one()
-        site_id = site.id
-
-        layer = session.query(tm.SegmentationLayer.id).\
-            filter_by(mapobject_type_id=mapobject_type_id, tpoint=tpoint).\
-            first()
-        layer_id = layer.id
 
         # This approach assumes that object segmentations have the same labels
         # across different z-planes.
         segmentations = session.query(
+                tm.MapobjectSegmentation.label,
                 tm.MapobjectSegmentation.mapobject_id,
-                tm.MapobjectSegmentation.label
             ).\
             filter(
-                tm.MapobjectSegmentation.partition_key == site_id,
-                tm.MapobjectSegmentation.segmentation_layer_id == layer_id
+                tm.MapobjectSegmentation.segmentation_layer_id == layer_id,
+                tm.MapobjectSegmentation.partition_key == partition_key,
+                tm.MapobjectSegmentation.geom_polygon.ST_CoveredBy(
+                    ref_segment.geom_polygon
+                )
             ).\
             all()
         if len(segmentations) == 0:
             raise ResourceNotFoundError(tm.MapobjectSegmentation)
 
-    with tm.utils.ExperimentConnection(experiment_id) as connection:
         feature_values = list()
         for mapobject_id, label in segmentations:
             try:
-                values = tm.FeatureValues(
-                    partition_key=site_id, mapobject_id=mapobject_id,
+                v = tm.FeatureValues(
+                    partition_key=partition_key, mapobject_id=mapobject_id,
                     values=data.loc[label], tpoint=tpoint
                 )
             except IndexError:
                 raise ResourceNotFoundError(
                     tm.MapobjectSegmentation, label=label
                 )
-            feature_values.append(values)
-        tm.FeatureValues.add_multiple(connection, feature_values)
+            feature_values.append(v)
+        session.bulk_ingest(feature_values)
 
     return jsonify(message='ok')
 
@@ -286,6 +322,11 @@ def get_feature_values(experiment_id, mapobject_type_id):
 
     .. note:: The table is send in form of a *CSV* stream with the first row
         representing column names.
+
+    .. warning:: Feature values are only returned for mapobjects that are
+        contained (fully enclosed!) by the specified region. In case mapobjects
+        span multiple sites, one must not specify the `well_pos_y` or
+        `well_pos_x` parameters.
     """
     plate_name = request.args.get('plate_name')
     well_name = request.args.get('well_name')
@@ -298,139 +339,143 @@ def get_feature_values(experiment_id, mapobject_type_id):
         experiment_name = experiment.name
 
     with tm.utils.ExperimentSession(experiment_id) as session:
-        mapobject_type = session.query(tm.MapobjectType).\
-            get(mapobject_type_id)
-        mapobject_type_name = mapobject_type.name
-        mapobject_type_ref_type = mapobject_type.ref_type
+        segmentation_layers = session.query(tm.SegmentationLayer).\
+            filter_by(mapobject_type_id=mapobject_type_id)
+        if tpoint is not None:
+            segmentation_layers = segmentation_layers.filter_by(tpoint=tpoint)
+        segmentation_layers = segmentation_layers.all()
+        layer_ids = [s.id for s in segmentation_layers]
 
-    if mapobject_type_ref_type in {'Plate', 'Well'}:
-        if well_pos_y is not None:
-            raise MalformedRequestError(
-                'Invalid query parameter "well_pos_y" for mapobjects of type '
-                '"{0}"'.format(mapobject_type_name)
-            )
-        if well_pos_x is not None:
-            raise MalformedRequestError(
-                'Invalid query parameter "well_pos_x" for mapobjects of type '
-                '"{0}"'.format(mapobject_type_name)
-            )
-        if mapobject_type_ref_type == 'Plate':
-            if well_name is not None:
+        mapobject_type = session.query(tm.MapobjectType).get(mapobject_type_id)
+        if well_pos_y is not None or well_pos_x is not None:
+            if mapobject_type.ref_type in {tm.Plate.__name__, tm.Well.__name__}:
                 raise MalformedRequestError(
-                    'Invalid query parameter "well_name" for mapobjects of type '
-                    '"{0}"'.format(mapobject_type_name)
+                    'Query parameters "well_pos_y" and "well_pos_x" are not '
+                    'supported for mapobject type "%s"' % mapobject_type.name
                 )
+            ref_model_name = getattr(
+                mapobject_type, 'ref_type', tm.Site.__name__
+            )
+            instances = session.query(
+                    tm.Site.id.label('ref_id'),
+                    tm.Site.well_id.label('partition_key'),
+                ).\
+                join(tm.Well).\
+                join(tm.Plate)
+        else:
+            if well_name is not None:
+                if mapobject_type.ref_type == tm.Plate.__name__:
+                    raise MalformedRequestError(
+                        'Query parameter "well_name" is not supported for '
+                        'mapobject type "%s"' % mapobject_type.name
+                    )
+            ref_model_name = getattr(
+                mapobject_type, 'ref_type', tm.Well.__name__
+            )
+            instances = session.query(
+                    tm.Well.id.label('ref_id'),
+                    tm.Well.id.label('partition_key'),
+                ).\
+                join(tm.Plate)
 
-    filename_formatstring = '{experiment}'
-    if plate_name is not None:
-        filename_formatstring += '_{plate}'
-    if well_name is not None:
-        filename_formatstring += '_{well}'
-    if well_pos_y is not None:
-        filename_formatstring += '_y{y}'
-    if well_pos_x is not None:
-        filename_formatstring += '_x{x}'
-    if tpoint is not None:
-        filename_formatstring += '_t{t}'
-    filename_formatstring += '_{object_type}_feature-values.csv'
-    filename = filename_formatstring.format(
-        experiment=experiment_name, plate=plate_name, well=well_name,
-        y=well_pos_y, x=well_pos_x,
-        t=tpoint, object_type=mapobject_type_name
-    )
+        filename_formatstring = '{experiment}'
+        if plate_name is not None:
+            filename_formatstring += '_{plate}'
+            instances = instances.filter(tm.Plate.name == plate_name)
+        if well_name is not None:
+            filename_formatstring += '_{well}'
+            instances = instances.filter(tm.Well.name == well_name)
+        if well_pos_y is not None:
+            filename_formatstring += '_y{y}'
+            instances = instances.filter(tm.Site.y == well_pos_y)
+        if well_pos_x is not None:
+            filename_formatstring += '_x{x}'
+            instances = instances.filter(tm.Site.x == well_pos_x)
+        if tpoint is not None:
+            filename_formatstring += '_t{t}'
+        instances = instances.all()
 
-    def generate_feature_matrix(mapobject_type_id, ref_type):
+        filename_formatstring += '_{object_type}_feature-values.csv'
+        filename = filename_formatstring.format(
+            experiment=experiment_name, plate=plate_name, well=well_name,
+            y=well_pos_y, x=well_pos_x,
+            t=tpoint, object_type=mapobject_type_name
+        )
+
+        features = session.query(tm.Feature.name).\
+            filter_by(mapobject_type_id=mapobject_type_id).\
+            order_by(tm.Feature.id).\
+            all()
+        feature_names = [f.name for f in features]
+
+        ref_mapobject_type = session.query(tm.MapobjectType).\
+            filter_by(ref_type=instances[0].__class__.__name__).\
+            one()
+        ref_mapobject_type_id = ref_mapobject_type.id
+
+        instances = [(inst.ref_id, inst.partition_key) for inst in instances]
+
+    def generate_feature_matrix():
         data = StringIO()
         w = csv.writer(data)
 
-        with tm.utils.ExperimentSession(experiment_id) as session:
-
-            results = _get_matching_layers(session, tpoint)
-            layer_lut = dict()
-            for r in results:
-                layer_lut[r.id] = {'tpoint': r.tpoint, 'zplane': r.zplane}
-
-            if ref_type == 'Plate':
-                results = _get_matching_plates(session, plate_name)
-            elif ref_type == 'Well':
-                results = _get_matching_wells(session, plate_name, well_name)
-            elif ref_type == 'Site':
-                results = _get_matching_sites(
-                    session, plate_name, well_name, well_pos_y, well_pos_x
-                )
-            ref_ids = [r.id for r in results]
-
-            features = session.query(tm.Feature.name).\
-                filter_by(mapobject_type_id=mapobject_type_id).\
-                order_by(tm.Feature.id).\
-                all()
-            feature_names = [f.name for f in features]
-
-            ref_mapobject_type = session.query(tm.MapobjectType.id).\
-                filter_by(ref_type=ref_type, id=mapobject_type_id).\
-                one()
-
-        w.writerow(tuple(feature_names))
+        column_names = ('id', ) + tuple(feature_names)
+        w.writerow(column_names)
         yield data.getvalue()
         data.seek(0)
         data.truncate(0)
 
-        for ref_id in ref_ids:
-            logger.debug('collect feature values for %s %d', ref_type, ref_id)
+        for ref_id, partition_key in instances:
             with tm.utils.ExperimentSession(experiment_id) as session:
-                mapobjects = _get_mapobjects_at_ref_position(
-                    session, mapobject_type_id, ref_id, layer_lut.keys()
-                )
-                mapobject_ids = [m.id for m in mapobjects]
-
-                if not mapobject_ids:
-                    logger.warn(
-                        'no mapobjects found for %s %d', ref_type, ref_id
-                    )
-                    continue
-
-                feature_values = session.query(
-                        tm.FeatureValues.mapobject_id, tm.FeatureValues.values
+                ref_segment = session.query(tm.MapobjectSegmentation).\
+                    join(tm.Mapobject).\
+                    filter(
+                        tm.Mapobject.ref_id == ref_id,
+                        tm.Mapobject.mapobject_type_id == ref_mapobject_type_id,
+                        tm.Mapobject.paritition_key == partition_key
                     ).\
-                    filter(tm.FeatureValues.mapobject_id.in_(mapobject_ids)).\
+                    one()
+                # Use OUTER JOIN to also include mapobjects that don't have
+                # any feature values.
+                feature_values = session.query(
+                        tm.MapobjectSegmentation.mapobject_id,
+                        tm.FeatureValues.values
+                    ).\
+                    outerjoin(tm.FeatureValues).\
+                    filter(
+                        tm.FeatureValues.partition_key == partition_key,
+                        tm.FeatureValues.tpoint.in_(tpoints),
+                        tm.MapobjectSegmentation.segmentation_layer_id.in_(layer_ids),
+                        tm.MapobjectSegmentation.geom_polygon.ST_CoveredBy(
+                            ref_segment.geom_polygon
+                        )
+                    ).\
+                    order_by(tm.MapobjectSegmentation.mapobject_id).\
                     all()
-                feature_values_lut = dict(feature_values)
 
-                if not feature_values_lut:
-                    logger.warn(
-                        'no feature values found for %s %d', ref_type, ref_id
-                    )
-                    continue
-
-                for mapobject_id, label, segmentation_layer_id in mapobjects:
-                    if mapobject_id not in feature_values_lut:
+                for mapobject_id, vals in feature_values:
+                    if vals is None:
                         logger.warn(
                             'no feature values found for mapobject %d',
                             mapobject_id
                         )
-                        w.writerow(tuple(
-                            [str(np.nan) for x in xrange(len(feature_names))]
-                        ))
-                        yield data.getvalue()
-                        data.seek(0)
-                        data.truncate(0)
-                        continue
-
-                    vals = feature_values_lut[mapobject_id]
-                    # Values must be sorted based on feature_id, such that they
-                    # end up in the correct column of the CSV table matching
-                    # the corresponding column names.
-                    # Feature IDs must be sorted as integers to get the
-                    # desired order.
-                    w.writerow(tuple([
-                        vals[k] for k in sorted(vals, key=lambda k: int(k))
-                    ]))
+                        v = [str(np.nan) for x in range(len(feature_names))]
+                    else:
+                        # Values must be sorted based on feature_id, such that
+                        # they end up in the correct column of the CSV table.
+                        # Feature IDs must be sorted as integers to get the
+                        # desired order.
+                        # TODO: Can we use HSTORE slice upon SELECT to ensure
+                        # values are in the correct order?
+                        v = [vals[k] for k in sorted(vals, key=lambda k: int(k))]
+                    v.insert(0, str(mapobject_id))
+                    w.writerow(tuple(v))
                 yield data.getvalue()
                 data.seek(0)
                 data.truncate(0)
 
     return Response(
-        generate_feature_matrix(mapobject_type_id, mapobject_type_ref_type),
+        generate_feature_matrix(),
         mimetype='text/csv',
         headers={
             'Content-Disposition': 'attachment; filename={filename}'.format(
@@ -470,6 +515,11 @@ def get_metadata(experiment_id, mapobject_type_id):
 
     .. note:: The table is send in form of a *CSV* stream with the first row
         representing column names.
+
+    .. warning:: Metadata are only returned for mapobjects that are
+        contained (fully enclosed!) by the specified region. In case mapobjects
+        span multiple sites, one must not specify the `well_pos_y` or
+        `well_pos_x` parameters.
     """
     plate_name = request.args.get('plate_name')
     well_name = request.args.get('well_name')
@@ -482,193 +532,201 @@ def get_metadata(experiment_id, mapobject_type_id):
         experiment_name = experiment.name
 
     with tm.utils.ExperimentSession(experiment_id) as session:
-        mapobject_type = session.query(tm.MapobjectType).\
-            get(mapobject_type_id)
-        mapobject_type_name = mapobject_type.name
-        mapobject_type_ref_type = mapobject_type.ref_type
+        segmentation_layers = session.query(tm.SegmentationLayer).\
+            filter_by(mapobject_type_id=mapobject_type_id)
+        if tpoint is not None:
+            segmentation_layers = segmentation_layers.filter_by(tpoint=tpoint)
+        segmentation_layers = segmentation_layers.all()
+        layer_ids = [s.id for s in segmentation_layers]
 
-    if mapobject_type_ref_type in {'Plate', 'Well'}:
-        if well_pos_y is not None:
-            raise MalformedRequestError(
-                'Invalid query parameter "well_pos_y" for mapobjects of type '
-                '"{0}"'.format(mapobject_type_name)
-            )
-        if well_pos_x is not None:
-            raise MalformedRequestError(
-                'Invalid query parameter "well_pos_x" for mapobjects of type '
-                '"{0}"'.format(mapobject_type_name)
-            )
-        if mapobject_type_ref_type == 'Plate':
-            if well_name is not None:
+        mapobject_type = session.query(tm.MapobjectType).get(mapobject_type_id)
+        if well_pos_y is not None or well_pos_x is not None:
+            if mapobject_type.ref_type in {tm.Plate.__name__, tm.Well.__name__}:
                 raise MalformedRequestError(
-                    'Invalid query parameter "well_name" for mapobjects of type '
-                    '"{0}"'.format(mapobject_type_name)
+                    'Query parameters "well_pos_y" and "well_pos_x" are not '
+                    'supported for mapobject type "%s"' % mapobject_type.name
                 )
+            ref_model_name = getattr(
+                mapobject_type, 'ref_type', tm.Site.__name__
+            )
+            instances = session.query(
+                    tm.Site.id.label('ref_id'),
+                    tm.Site.well_id.label('partition_key'),
+                ).\
+                join(tm.Well).\
+                join(tm.Plate)
+        else:
+            if well_name is not None:
+                if mapobject_type.ref_type == tm.Plate.__name__:
+                    raise MalformedRequestError(
+                        'Query parameter "well_name" is not supported for '
+                        'mapobject type "%s"' % mapobject_type.name
+                    )
+            ref_model_name = getattr(
+                mapobject_type, 'ref_type', tm.Well.__name__
+            )
+            instances = session.query(
+                    tm.Well.id.label('ref_id'),
+                    tm.Well.id.label('partition_key'),
+                ).\
+                join(tm.Plate)
 
-    filename_formatstring = '{experiment}'
-    if plate_name is not None:
-        filename_formatstring += '_{plate}'
-    if well_name is not None:
-        filename_formatstring += '_{well}'
-    if well_pos_y is not None:
-        filename_formatstring += '_y{y}'
-    if well_pos_x is not None:
-        filename_formatstring += '_x{x}'
-    if tpoint is not None:
-        filename_formatstring += '_t{t}'
-    filename_formatstring += '_{object_type}_metadata.csv'
-    filename = filename_formatstring.format(
-        experiment=experiment_name, plate=plate_name, well=well_name,
-        y=well_pos_y, x=well_pos_x,
-        t=tpoint, object_type=mapobject_type_name
-    )
+        filename_formatstring = '{experiment}'
+        if plate_name is not None:
+            filename_formatstring += '_{plate}'
+            instances = instances.filter(tm.Plate.name == plate_name)
+        if well_name is not None:
+            filename_formatstring += '_{well}'
+            instances = instances.filter(tm.Well.name == well_name)
+        if well_pos_y is not None:
+            filename_formatstring += '_y{y}'
+            instances = instances.filter(tm.Site.y == well_pos_y)
+        if well_pos_x is not None:
+            filename_formatstring += '_x{x}'
+            instances = instances.filter(tm.Site.x == well_pos_x)
+        if tpoint is not None:
+            filename_formatstring += '_t{t}'
+        instances = instances.all()
 
-    def generate_feature_matrix(mapobject_type_id, ref_type):
+        filename_formatstring += '_{object_type}_metadata.csv'
+        filename = filename_formatstring.format(
+            experiment=experiment_name, plate=plate_name, well=well_name,
+            y=well_pos_y, x=well_pos_x,
+            t=tpoint, object_type=mapobject_type_name
+        )
+
+        results = session.query(tm.ToolResult.name).\
+            filter_by(mapobject_type_id=mapobject_type_id).\
+            order_by(tm.ToolResult.id).\
+            all()
+        result_names = [r.name for r in results]
+
+        ref_mapobject_type = session.query(tm.MapobjectType).\
+            filter_by(ref_type=instances[0].__class__.__name__).\
+            one()
+        ref_mapobject_type_id = ref_mapobject_type.id
+
+        instances = [(inst.ref_id, inst.partition_key) for inst in instances]
+
+    def generate_feature_matrix():
         data = StringIO()
         w = csv.writer(data)
 
-        with tm.utils.ExperimentSession(experiment_id) as session:
+        if ref_model_name == tm.Plate.__name__:
+            position_names = [
+                'plate_name'
+            ]
+        elif ref_model_name == tm.Well.__name__:
+            position_names = [
+                'plate_name', 'well_name'
+            ]
+        else:
+            position_names = [
+                'plate_name', 'well_name', 'well_pos_y', 'well_pos_x'
+            ]
+        segmentation_names = ['tpoint', 'label', 'is_border']
 
-            results = _get_matching_layers(session, tpoint)
-            layer_lut = dict()
-            for r in results:
-                layer_lut[r.id] = {'tpoint': r.tpoint, 'zplane': r.zplane}
-
-            ref_position_lut = dict()
-            if ref_type == 'Plate':
-                results = _get_matching_plates(session, plate_name)
-                for r in results:
-                    ref_position_lut[r.id] = {
-                        'plate_name': r.plate_name,
-                    }
-                metadata_names = [
-                    'plate_name'
-                ]
-            elif ref_type == 'Well':
-                results = _get_matching_wells(session, plate_name, well_name)
-                for r in results:
-                    ref_position_lut[r.id] = {
-                        'plate_name': r.plate_name,
-                        'well_name': r.well_name,
-                    }
-                metadata_names = [
-                    'plate_name', 'well_name'
-                ]
-            elif ref_type == 'Site':
-                results = _get_matching_sites(
-                    session, plate_name, well_name, well_pos_y, well_pos_x
-                )
-                for r in results:
-                    ref_position_lut[r.id] = {
-                        'well_pos_y': r.well_pos_y,
-                        'well_pos_x': r.well_pos_x,
-                        'plate_name': r.plate_name,
-                        'well_name': r.well_name,
-                    }
-                metadata_names = [
-                    'plate_name', 'well_name', 'well_pos_y', 'well_pos_x',
-                    'tpoint', 'zplane', 'label', 'is_border'
-                ]
-
-            tool_results = session.query(tm.ToolResult.id, tm.ToolResult.name).\
-                filter_by(mapobject_type_id=mapobject_type_id).\
-                order_by(tm.ToolResult.id).\
-                all()
-            tool_result_names = [t.name for t in tool_results]
-            tool_result_ids = [t.id for t in tool_results]
-
-            ref_mapobject_type = session.query(tm.MapobjectType.id).\
-                filter_by(ref_type=ref_type).\
-                order_by(tm.MapobjectType.id).\
-                first()
-
-        w.writerow(tuple(metadata_names + tool_result_names))
+        column_names = ['id']
+        column_names.extend(position_names)
+        column_names.extend(segmentation_names)
+        column_names.extend(tool_result_names)
+        w.writerow(tuple(column_names))
         yield data.getvalue()
         data.seek(0)
         data.truncate(0)
 
-        for ref_id in ref_position_lut:
-            logger.info('collect metadata for %s %d', ref_type, ref_id)
+        for ref_id, partition_key in instances:
             with tm.utils.ExperimentSession(experiment_id) as session:
-                mapobjects = _get_mapobjects_at_ref_position(
-                    session, mapobject_type_id, ref_id, layer_lut.keys()
-                )
-                mapobject_ids = [m.id for m in mapobjects]
 
-                if not mapobject_ids:
-                    logger.warn(
-                        'no mapobjects found for %s %d', ref_type, ref_id
-                    )
-                    continue
-
-                if ref_type == 'Site':
-                    border_segmentations = _get_border_mapobjects_at_ref_position(
-                        session, mapobject_ids, ref_mapobject_type.id, ref_id
-                    )
-                    border_mapobject_ids = [
-                        s.mapobject_id for s in border_segmentations
-                    ]
-
-                label_values = session.query(
-                        tm.LabelValues.mapobject_id, tm.LabelValues.values
+                if ref_model_name == tm.Plate.__name__:
+                    position_values = session.query(
+                        tm.Plate.name.label('plate_name')
+                        null().label('well_name'),
+                        null().label('well_pos_y'),
+                        null().label('well_pos_x')
                     ).\
-                    filter(tm.LabelValues.mapobject_id.in_(mapobject_ids)).\
+                    join(tm.Well).\
+                    filter(tm.Well.id == ref_id).\
+                    one()
+                elif ref_model_name == tm.Well.__name__:
+                    position_values = session.query(
+                        tm.Plate.name.label('plate_name'),
+                        tm.Well.name.label('well_name'),
+                        null().label('well_pos_y'),
+                        null().label('well_pos_x')
+                    ).\
+                    filter(tm.Well.id == ref_id).\
+                    one()
+                else:
+                    position_values = session.query(
+                        tm.Plate.name.label('plate_name'),
+                        tm.Well.name.label('well_name'),
+                        tm.Site.y.label('well_pos_y'),
+                        tm.Site.x.label('well_pos_x')
+                    ).\
+                    join(tm.Well).\
+                    join(tm.Site).\
+                    filter(tm.Site.id == ref_id).\
+                    one()
+
+                ref_segment = session.query(tm.MapobjectSegmentation).\
+                    join(tm.Mapobject).\
+                    filter(
+                        tm.Mapobject.ref_id == ref_id,
+                        tm.Mapobject.mapobject_type_id == ref_mapobject_type_id,
+                        tm.Mapobject.paritition_key == partition_key
+                    ).\
+                    one()
+
+                # LEFT OUTER JOIN to also include mapobjects that don't have
+                # any feature values.
+                is_border = tm.MapobjectSegmentation.geom_polygon.ST_Intersects(
+                    ref_segment.geom_polygon.ST_Boundary()
+                )
+                label_values = session.query(
+                        tm.MapobjectSegmentation.mapobject_id,
+                        tm.LabelValues.values,
+                        tm.LabelValues.tpoint,
+                        tm.MapobjectSegmentation.label,
+                        case([(is_border, True)], else_=False)
+                    ).\
+                    outerjoin(tm.LabelValues).\
+                    filter(
+                        tm.MapobjectSegmentation.segmentation_layer_id.in_(layer_ids),
+                        tm.MapobjectSegmentation.geom_polygon.ST_CoveredBy(
+                            ref_segment.geom_polygon
+                        ),
+                        tm.MapobjectSegmentation.partition_key == partition_key,
+                        tm.LabelValues.tpoint.in_(tpoints)
+                    ).\
+                    order_by(tm.MapobjectSegmentation.mapobject_id).\
                     all()
-                label_values_lut = dict(label_values)
 
-                warn = True
-                if not label_values_lut:
-                    warn = False
-
-                rows = list()
-                for mapobject_id, label, segmenation_layer_id in mapobjects:
-                    metadata_values = [ref_position_lut[ref_id]['plate_name']]
-
-                    if 'well_name' in ref_position_lut[ref_id]:
-                        metadata_values.append(
-                            ref_position_lut[ref_id]['well_name']
+                for mapobject_id, vals, tpoint, label, is_border in label_values:
+                    if vals is None:
+                        logger.warn(
+                            'no label values found for mapobject %d '
+                            'at time point %d', mapobject_id, tpoint
                         )
-
-                    if 'well_pos_y' in ref_position_lut[ref_id]:
-                        metadata_values.extend([
-                            str(ref_position_lut[ref_id]['well_pos_y']),
-                            str(ref_position_lut[ref_id]['well_pos_x']),
-                        ])
-
-                    if layer_lut[segmenation_layer_id]['tpoint'] is not None:
-                        metadata_values.extend([
-                            str(layer_lut[segmenation_layer_id]['tpoint']),
-                            str(layer_lut[segmenation_layer_id]['zplane']),
-                            str(label),
-                            str(1 if mapobject_id in border_mapobject_ids else 0)
-                        ])
-
-                    if mapobject_id not in label_values_lut:
-                        if warn:
-                            logger.warn(
-                                'no label values found for mapobject %d',
-                                mapobject_id
-                            )
-                        metadata_values += [
-                            str(np.nan) for x in xrange(len(tool_result_names))
-                        ]
+                        v = [str(np.nan) for x in range(len(tool_result_names))]
                     else:
-                        vals = label_values_lut[mapobject_id]
-                        tool_result_values = list()
-                        for tid in tool_result_ids:
-                            try:
-                                v = vals[str(tid)]
-                            except KeyError:
-                                v = str(np.nan)
-                            tool_result_values.append(v)
-                        metadata_values += tool_result_values
-                    w.writerow(tuple(metadata_values))
+                        # The order of keys in the HSTORE is not relevant and
+                        # may not be reproduced on output. To ensure that
+                        # values end up in the correct column, we sort values
+                        # based on keys (feature IDs).
+                        # Feature IDs must be sorted as integers to get the
+                        # desired order.
+                        v = [vals[k] for k in sorted(vals, key=lambda k: int(k))]
+                    v.insert(0, str(mapobject_id))
+                    v.extend(position_values)
+                    v.extend([tpoint, label, is_border])
+                    w.writerow(tuple(v))
                 yield data.getvalue()
                 data.seek(0)
                 data.truncate(0)
 
     return Response(
-        generate_feature_matrix(mapobject_type_id, mapobject_type_ref_type),
+        generate_feature_matrix(),
         mimetype='text/csv',
         headers={
             'Content-Disposition': 'attachment; filename={filename}'.format(
