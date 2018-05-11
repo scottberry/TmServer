@@ -110,7 +110,9 @@ def update_project(experiment_id):
     '''
     logger.info('save jterator project of experiment %d', experiment_id)
     data = json.loads(request.data)
+    logger.info('data[project] %s',data['project'])
     project = yaml.load(data['project'])
+    logger.info('project %s',project)
     pipeline_description = PipelineDescription(**project['pipe']['description'])
     handles_descriptions = dict()
     for h in project['handles']:
